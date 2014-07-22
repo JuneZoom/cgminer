@@ -1671,33 +1671,24 @@ static void *rock_result_process(void *userdata)
 			chip_no = DATA_REPLY(ritem)->chip_no;
 			nonce = DATA_REPLY(ritem)->nonce;
 			whead = DATA_REPLY(ritem)->whead;
-			worig = witem = DATA_REPLY(ritem)->witem;
-			if (witem)
-				dirprev = true;
-			else {
-				witem = whead;
-				dirprev = false;
-			}
-			wstart = witem;
+
 			found = false;
-int count, count2;
-count = info->work_list[chip_no]->count_up;
-count2 = info->work_list[chip_no]->count;
-applog(LOG_RBX, "%s%i: ZZ RES 0x%08x chip_no %d task_no %u cmd %u witem %p whead %p (%d:%d)",
-icarus->drv->name, icarus->device_id,
-nonce, chip_no, DATA_REPLY(ritem)->task_no, DATA_REPLY(ritem)->cmd_value,
-witem, whead, count, count2);
-			prevs = nexts = 0;
-			while (!found) {
-				work = DATA_WORK(witem)->work;
-				info->work_checked++;
+			correction_times = 0;
+			while (!found && correction_times < NONCE_CORRECTION_TIMES) {
+				worig = witem = DATA_REPLY(ritem)->witem;
+				if (witem)
+					dirprev = true;
+				else {
+					witem = whead;
+					dirprev = false;
+				}
+				wstart = witem;
+				prevs = nexts = 0;
+				while (!found) {
+					work = DATA_WORK(witem)->work;
+					if (correction_times == 0)
+						info->work_checked++;
 
-applog(LOG_RBX, "%s%i: ZZ looking at: result %08x workid %u chip_no %d task_no %u p=%d n=%d",
-icarus->drv->name, icarus->device_id,
-nonce, work->id, chip_no, DATA_REPLY(ritem)->task_no, prevs, nexts);
-
-				correction_times = 0;
-				while (!found && correction_times < NONCE_CORRECTION_TIMES) {
 					if (correction_times > 0) {
 						info->nonces_correction_tests++;
 						if (correction_times == 1)
@@ -1706,9 +1697,6 @@ nonce, work->id, chip_no, DATA_REPLY(ritem)->task_no, prevs, nexts);
 					info->nonce_tests++;
 					if (test_nonce(work, nonce + rbox_corr_values[correction_times])) {
 						submit_tested_work(thr, work);
-applog(LOG_RBX, "%s%i: ZZ result OK %08x workid %u chip_no %d task_no %u p=%d n=%d (%d:%d)",
-icarus->drv->name, icarus->device_id,
-nonce, work->id, chip_no, DATA_REPLY(ritem)->task_no, prevs, nexts, count, count2);
 						found = true;
 						K_WLOCK(info->results_list);
 						info->new_nonces++;
@@ -1718,44 +1706,33 @@ nonce, work->id, chip_no, DATA_REPLY(ritem)->task_no, prevs, nexts, count, count
 
 						info->nonces_correction[correction_times]++;
 						info->failing = false;
-					} else
-						correction_times++;
-				}
-
-				if (!found) {
-applog(LOG_RBX, "%s%i: ZZ failed to find: result 0x%08x workid %u chip_no %d task_no %u p=%d n=%d (%d:%d)",
-icarus->drv->name, icarus->device_id,
-nonce, work->id, chip_no, DATA_REPLY(ritem)->task_no, prevs, nexts, count, count2);
-					if (dirprev) {
-						if (witem == whead) {
-							witem = wstart;
-							dirprev = false;
-						} else {
-							witem = witem->prev;
-							prevs++;
+					} else {
+						if (dirprev) {
+							if (witem == whead) {
+								witem = wstart;
+								dirprev = false;
+							} else {
+								witem = witem->prev;
+								prevs++;
+							}
 						}
-					}
-					if (!dirprev) {
-					// This will probably be a HW error
-						if (witem && witem->next) {
-							witem = witem->next;
-							nexts++;
-						} else {
-							break;
-applog(LOG_RBX, "%s%i: ZZ ... 0x%08x workid %u chip %d ... and ran out of options p=%d n=%d",
-icarus->drv->name, icarus->device_id,
-nonce, work->id, chip_no, prevs, nexts);
+						if (!dirprev) {
+							if (witem && witem->next) {
+								witem = witem->next;
+								nexts++;
+							} else {
+								break;
+							}
 						}
 					}
 				}
+				correction_times++;
 			}
 			if (!found) {
 				inc_hw_errors(thr);
 				info->rock_bad[chip_no]++;
 				info->rmdev.errors[chip_no]++;
 			}
-applog(LOG_RBX, "%s%i: ZZ discard checking ... chip_no %d (0x%08x) ...",
-icarus->drv->name, icarus->device_id, chip_no, nonce);
 			K_WLOCK(info->wfree_list);
 			if (whead)
 				DATA_WORK(whead)->referenced--;
@@ -1769,8 +1746,6 @@ icarus->drv->name, icarus->device_id, chip_no, nonce);
 					if (!DATA_WORK(wtail)->completed) {
 						DATA_WORK(wtail)->completed = true;
 						info->work_list[chip_no]->count_up--;
-applog(LOG_RBX, "%s%i: ZZ discard checking ... chip_no %d (0x%08x) ... item wasn't complete - marked",
-icarus->drv->name, icarus->device_id, chip_no, nonce);
 					}
 					/* Switch results that point to the work about to be freed
 					 * Can only happen if we've advanced prev (not next) */
@@ -1789,8 +1764,6 @@ icarus->drv->name, icarus->device_id, chip_no, nonce);
 								DATA_REPLY(rtmp)->witem = witem;
 								if (witem)
 									DATA_WORK(witem)->referenced++;
-applog(LOG_RBX, "%s%i: ZZ ADJUSTING other result",
-icarus->drv->name, icarus->device_id);
 							}
 							rtmp = rtmp->next;
 						}
@@ -1810,15 +1783,11 @@ icarus->drv->name, icarus->device_id);
 				if (!DATA_WORK(wtail)->completed) {
 					DATA_WORK(wtail)->completed = true;
 					info->work_list[chip_no]->count_up--;
-applog(LOG_RBX, "%s%i: ZZ discard checking ... chip_no %d (0x%08x) ... TAIL wasn't complete!!! - marked",
-icarus->drv->name, icarus->device_id, chip_no, nonce);
 				}
 				wtail = k_unlink_tail(info->work_list[chip_no]);
 				free_work(DATA_WORK(wtail)->work);
 				k_add_head(info->wfree_list, wtail);
 				wtail = info->work_list[chip_no]->tail;
-applog(LOG_RBX, "%s%i: ZZ discarding ... chip_no %d (0x%08x) ... tail discarded",
-icarus->drv->name, icarus->device_id, chip_no, nonce);
 			}
 			K_WUNLOCK(info->wfree_list);
 
