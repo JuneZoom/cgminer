@@ -212,7 +212,7 @@ static bool no_work;
 char *opt_icarus_options = NULL;
 char *opt_icarus_timing = NULL;
 float opt_anu_freq = 200;
-float opt_rock_freq = 270;
+float opt_rock_freq;
 #endif
 bool opt_worktime;
 #ifdef USE_AVALON
