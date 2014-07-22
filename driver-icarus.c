@@ -202,6 +202,10 @@ static const char *MODE_UNKNOWN_STR = "unknown";
 #define	RM_PRODUCT_T2		0x80
 #define	RM_PRODUCT_TEST		0xC0
 
+#define RM_FREQ(_f)		((int)((int)(_f) / 10) - 1)
+#define RM_FREQ_VALUE(_f)	(((int)(_f) + 1) * 10)
+#define RM_TEST_FREQ		RM_FREQ(270)
+
 #if (NONCE_CORRECTION_TIMES == 9)
 static int32_t rbox_corr_values[] = {0, 1, -1, 2, -2, 3, -3, 4, -4};
 #endif
@@ -237,21 +241,19 @@ typedef enum {
 	ROCKMINER_MAX
 } ROCKMINER_PRODUCT_T;
 
-typedef struct rockminer_chip_info {
-	unsigned char freq;
-	int error_cnt;
-	time_t last_received_task_complete_time;
-} ROCKMINER_CHIP_INFO;
-
 typedef struct rockminer_device_info {
 	unsigned char detect_chip_no;
 	unsigned char chip_max;
 	unsigned char product_id;
-	float min_frq;
-	float def_frq;
-	float max_frq;
-	ROCKMINER_CHIP_INFO chip[MAX_CHIP_NUM];
-	time_t dev_detect_time;
+	float min_freq;
+	float def_freq;
+	float max_freq;
+	unsigned char freq[MAX_CHIP_NUM];
+	struct timeval last_change[MAX_CHIP_NUM];
+	struct timeval last_check_time[MAX_CHIP_NUM];
+	uint64_t last_check_count[MAX_CHIP_NUM];
+	uint64_t nonces[MAX_CHIP_NUM];
+	uint64_t errors[MAX_CHIP_NUM];
 } ROCKMINER_DEVICE_INFO;
 
 // *** Work sent
@@ -341,9 +343,9 @@ struct ICARUS_INFO {
 	char rock_init[64];
 	uint64_t nonces_checked;
 	uint64_t nonces_unchecked;
+	uint64_t nonce_tests;
 	uint64_t nonces_correction_times;
 	uint64_t nonces_correction_tests;
-	uint64_t nonces_fail;
 	uint64_t nonces_correction[NONCE_CORRECTION_TIMES];
 
 	bool initialised;
@@ -353,11 +355,6 @@ struct ICARUS_INFO {
 	struct timeval last_work[MAX_CHIP_NUM];
 
 	uint64_t work_checked;
-	int work_min;
-	int work_max;
-	uint64_t work_height;
-	int work_height_min;
-	int work_height_max;
 
 	int new_nonces;
 	K_LIST *rfree_list;
@@ -1090,24 +1087,6 @@ static bool set_anu_freq(struct cgpu_info *icarus, struct ICARUS_INFO *info)
 	return true;
 }
 
-static void rock_init_last_received_task_complete_time(struct ICARUS_INFO *info)
-{
-	int i;
-
-	if (opt_rock_freq < info->rmdev.min_frq ||
-	    opt_rock_freq > info->rmdev.max_frq)
-		opt_rock_freq = info->rmdev.def_frq;
-
-	for (i = 0; i < MAX_CHIP_NUM; ++i) {
-		info->rmdev.chip[i].last_received_task_complete_time = time(NULL);
-		info->rmdev.chip[i].freq = opt_rock_freq/10 - 1;
-		info->rmdev.chip[i].error_cnt = 0;
-	}
-
-	info->rmdev.dev_detect_time = time(NULL);
-}
-
-
 static void icarus_clear(struct cgpu_info *icarus, struct ICARUS_INFO *info)
 {
 	char buf[512];
@@ -1390,12 +1369,30 @@ shin:
 static bool rock_prepare(struct thr_info *thr);
 static int64_t rock_scanwork(struct thr_info *thr);
 
-static void rock_statline_before(char *buf, size_t bufsiz, struct cgpu_info *cgpu)
+static void rock_statline_before(char *buf, size_t bufsiz, struct cgpu_info *icarus)
 {
-	if (cgpu->temp)
-		tailsprintf(buf, bufsiz, "%3.0fMHz %3.0fC", opt_rock_freq, cgpu->temp);
+	struct ICARUS_INFO *info = (struct ICARUS_INFO *)(icarus->device_data);
+	int freq, maxfreq = 0, minfreq = 0;
+	char freq_buf[64];
+	int i;
+
+	for (i = 0; i < info->rmdev.chip_max; i++) {
+		freq = RM_FREQ_VALUE(info->rmdev.freq[i]);
+		if (maxfreq < freq)
+			maxfreq = freq;
+		if (minfreq == 0 || minfreq > freq)
+			minfreq = freq;
+	}
+
+	if (minfreq == maxfreq)
+		snprintf(freq_buf, sizeof(freq_buf), "%d", minfreq);
 	else
-		tailsprintf(buf, bufsiz, "%.0fMHz", opt_rock_freq);
+		snprintf(freq_buf, sizeof(freq_buf), "%d-%d", minfreq, maxfreq);
+
+	if (icarus->temp)
+		tailsprintf(buf, bufsiz, "%sMHz %3.0fC", freq_buf,  icarus->temp);
+	else
+		tailsprintf(buf, bufsiz, "%sMHz", freq_buf);
 }
 
 #define LOG_RBX LOG_DEBUG
@@ -1462,7 +1459,7 @@ static struct cgpu_info *rock_detect_one(struct libusb_device *dev, struct usb_f
 		icarus_initialise(icarus, info->baud);
 
 		applog(LOG_DEBUG, "tries: %d", tries);
-		workdata.unused[ICARUS_UNUSED_SIZE - 3] = opt_rock_freq/10 - 1;
+		workdata.unused[ICARUS_UNUSED_SIZE - 3] = RM_TEST_FREQ;
 		workdata.unused[ICARUS_UNUSED_SIZE - 2] = (MAX_TRIES-1-tries);
 		info->rmdev.detect_chip_no++;
 		if (info->rmdev.detect_chip_no >= MAX_TRIES)
@@ -1494,25 +1491,25 @@ icarus->drv->name, icarus->device_id,
 				newname = "LIR"; // Rocketbox
 				info->rmdev.product_id = ROCKMINER_T1;
 				info->rmdev.chip_max = 12;
-				info->rmdev.min_frq = 200;
-				info->rmdev.def_frq = 300;
-				info->rmdev.max_frq = 400;
+				info->rmdev.min_freq = 200;
+				info->rmdev.def_freq = 300;
+				info->rmdev.max_freq = 400;
 				break;
 			case RM_PRODUCT_T2: // what's this?
 				newname = "LIX";
 				info->rmdev.product_id = ROCKMINER_T2;
 				info->rmdev.chip_max = 16;
-				info->rmdev.min_frq = 200;
-				info->rmdev.def_frq = 300;
-				info->rmdev.max_frq = 400;
+				info->rmdev.min_freq = 200;
+				info->rmdev.def_freq = 300;
+				info->rmdev.max_freq = 400;
 				break;
 			case RM_PRODUCT_RBOX:
 				newname = "LIN"; // R-Box
 				info->rmdev.product_id = ROCKMINER_RBOX;
 				info->rmdev.chip_max = 4;
-				info->rmdev.min_frq = 200;
-				info->rmdev.def_frq = 270;
-				info->rmdev.max_frq = 400;
+				info->rmdev.min_freq = 200;
+				info->rmdev.def_freq = 270;
+				info->rmdev.max_freq = 400;
 				break;
 			default:
 				continue;
@@ -1528,8 +1525,8 @@ icarus->drv->name, icarus->device_id,
 		reply.cmd_value = nonce_bin[NONCE_TASK_CMD_OFFSET] & RM_CMD_MASK;
 		if (reply.cmd_value == NONCE_TASK_COMPLETE_CMD) {
 			applog(LOG_DEBUG, "complete g_detect_chip_no: %d", info->rmdev.detect_chip_no);
-			workdata.unused[ICARUS_UNUSED_SIZE - 3] = opt_rock_freq/10 - 1;
-			workdata.unused[ICARUS_UNUSED_SIZE - 2] =  info->rmdev.detect_chip_no;
+			workdata.unused[ICARUS_UNUSED_SIZE - 3] = RM_TEST_FREQ;
+			workdata.unused[ICARUS_UNUSED_SIZE - 2] = info->rmdev.detect_chip_no;
 			info->rmdev.detect_chip_no++;
 			if (info->rmdev.detect_chip_no >= MAX_TRIES)
 				info->rmdev.detect_chip_no = 0;
@@ -1549,8 +1546,6 @@ icarus->drv->name, icarus->device_id,
 		while (correction_times < NONCE_CORRECTION_TIMES) {
 			nonce_hex = bin2hex(nonce_bin, 4);
 			if (golden_nonce_val == reply.nonce + rbox_corr_values[correction_times]) {
-				rock_init_last_received_task_complete_time(info);
-
 				ok = true;
 				break;
 			} else {
@@ -1581,6 +1576,9 @@ icarus->drv->name, icarus->device_id,
 
 	applog(LOG_DEBUG, "Icarus Detect: Test succeeded at %s: got %s",
 		          icarus->device_path, golden_nonce);
+
+	for (i = 0; i < info->rmdev.chip_max; i++)
+		info->rmdev.freq[i] = RM_FREQ(info->rmdev.def_freq);
 
 	/* We have a real Rockminer! */
 	if (!add_cgpu(icarus))
@@ -1648,7 +1646,7 @@ static void *rock_result_process(void *userdata)
 	struct ICARUS_INFO *info = (struct ICARUS_INFO *)(icarus->device_data);
 	struct thr_info *thr = info->thr;
 	int correction_times = 0;
-	K_ITEM *ritem, *rtmp, *witem, *whead, *wtail, *worig;
+	K_ITEM *ritem, *rtmp, *witem, *whead, *wtail, *worig, *wstart;
 	uint32_t nonce;
 	struct work *work;
 	struct timeval now;
@@ -1673,14 +1671,14 @@ static void *rock_result_process(void *userdata)
 			chip_no = DATA_REPLY(ritem)->chip_no;
 			nonce = DATA_REPLY(ritem)->nonce;
 			whead = DATA_REPLY(ritem)->whead;
-			witem = DATA_REPLY(ritem)->witem;
+			worig = witem = DATA_REPLY(ritem)->witem;
 			if (witem)
 				dirprev = true;
 			else {
 				witem = whead;
 				dirprev = false;
 			}
-			worig = witem;
+			wstart = witem;
 			found = false;
 int count, count2;
 count = info->work_list[chip_no]->count_up;
@@ -1692,6 +1690,7 @@ witem, whead, count, count2);
 			prevs = nexts = 0;
 			while (!found) {
 				work = DATA_WORK(witem)->work;
+				info->work_checked++;
 
 applog(LOG_RBX, "%s%i: ZZ looking at: result %08x workid %u chip_no %d task_no %u p=%d n=%d",
 icarus->drv->name, icarus->device_id,
@@ -1704,6 +1703,7 @@ nonce, work->id, chip_no, DATA_REPLY(ritem)->task_no, prevs, nexts);
 						if (correction_times == 1)
 							info->nonces_correction_times++;
 					}
+					info->nonce_tests++;
 					if (test_nonce(work, nonce + rbox_corr_values[correction_times])) {
 						submit_tested_work(thr, work);
 applog(LOG_RBX, "%s%i: ZZ result OK %08x workid %u chip_no %d task_no %u p=%d n=%d (%d:%d)",
@@ -1714,6 +1714,7 @@ nonce, work->id, chip_no, DATA_REPLY(ritem)->task_no, prevs, nexts, count, count
 						info->new_nonces++;
 						K_WUNLOCK(info->results_list);
 						info->rock_good[chip_no]++;
+						info->rmdev.nonces[chip_no]++;
 
 						info->nonces_correction[correction_times]++;
 						info->failing = false;
@@ -1727,7 +1728,7 @@ icarus->drv->name, icarus->device_id,
 nonce, work->id, chip_no, DATA_REPLY(ritem)->task_no, prevs, nexts, count, count2);
 					if (dirprev) {
 						if (witem == whead) {
-							witem = worig;
+							witem = wstart;
 							dirprev = false;
 						} else {
 							witem = witem->prev;
@@ -1751,16 +1752,18 @@ nonce, work->id, chip_no, prevs, nexts);
 			if (!found) {
 				inc_hw_errors(thr);
 				info->rock_bad[chip_no]++;
+				info->rmdev.errors[chip_no]++;
 			}
 applog(LOG_RBX, "%s%i: ZZ discard checking ... chip_no %d (0x%08x) ...",
 icarus->drv->name, icarus->device_id, chip_no, nonce);
 			K_WLOCK(info->wfree_list);
 			if (whead)
 				DATA_WORK(whead)->referenced--;
-			if (witem)
-				DATA_WORK(witem)->referenced--;
+			if (worig)
+				DATA_WORK(worig)->referenced--;
 			if (found) {
-				// All older unreferenced work is finished
+				/* All older unreferenced work 'should' be finished
+				 * but there may be more results the same as the current */
 				wtail = info->work_list[chip_no]->tail;
 				while (wtail && wtail != witem && DATA_WORK(wtail)->referenced < 1) {
 					if (!DATA_WORK(wtail)->completed) {
@@ -1777,8 +1780,15 @@ icarus->drv->name, icarus->device_id, chip_no, nonce);
 						rtmp = info->results_list->head;
 						while (rtmp) {
 							if (DATA_REPLY(rtmp)->witem == wtail) {
+								// No deref since it'll be deleted anyway
+								if (DATA_REPLY(rtmp)->whead == wtail) {
+									DATA_REPLY(rtmp)->whead = whead;
+									if (whead)
+										DATA_WORK(whead)->referenced++;
+								}
 								DATA_REPLY(rtmp)->witem = witem;
-								DATA_REPLY(rtmp)->whead = whead;
+								if (witem)
+									DATA_WORK(witem)->referenced++;
 applog(LOG_RBX, "%s%i: ZZ ADJUSTING other result",
 icarus->drv->name, icarus->device_id);
 							}
@@ -1877,24 +1887,45 @@ static void cmr2_commands(struct cgpu_info *icarus)
 	}
 }
 
-void rock_send_task(struct cgpu_info *icarus, struct work *work, unsigned char chip_no)
+void rock_send_task(struct cgpu_info *icarus, struct work *work, unsigned char chip)
 {
 	struct ICARUS_INFO *info = (struct ICARUS_INFO *)(icarus->device_data);
+	struct timeval now;
+	double errors;
 	int err, amount;
 	struct ICARUS_WORK workdata;
 	char *ob_hex;
 	K_ITEM *witem;
 
+	cgtime(&(now));
+	// These 4 constants may need parameterizing ...
+	if (tdiff(&now, &(info->rmdev.last_check_time[chip])) > 60 &&
+	    (info->rmdev.nonces[chip] + info->rmdev.errors[chip] -
+	     info->rmdev.last_check_count[chip]) > 100) {
+		errors = (double)(info->rmdev.errors[chip]) /
+			 (double)(info->rmdev.errors[chip] + info->rmdev.nonces[chip]);
+		if (errors < 0.001) {
+			if (RM_FREQ_VALUE(info->rmdev.freq[chip]) < info->rmdev.max_freq) {
+				info->rmdev.freq[chip]++;
+				memcpy(&(info->rmdev.last_change[chip]), &now, sizeof(now));
+			}
+		} else if (errors > 0.03) {
+			if (RM_FREQ_VALUE(info->rmdev.freq[chip]) > info->rmdev.min_freq) {
+				info->rmdev.freq[chip]--;
+				memcpy(&(info->rmdev.last_change[chip]), &now, sizeof(now));
+			}
+		}
+		info->rmdev.last_check_count[chip] = info->rmdev.nonces[chip] +
+							info->rmdev.errors[chip];
+		memcpy(&(info->rmdev.last_check_time[chip]), &now, sizeof(now));
+	}
+
 	memset((void *)(&workdata), 0, sizeof(workdata));
 	memcpy(&(workdata.midstate), work->midstate, ICARUS_MIDSTATE_SIZE);
 	memcpy(&(workdata.work), work->data + ICARUS_WORK_DATA_OFFSET, ICARUS_WORK_SIZE);
 	workdata.unused[ICARUS_UNUSED_SIZE - 4] = 0xaa;
-	if (info->rmdev.chip[chip_no].freq > (info->rmdev.max_frq/10 - 1) || 
-	    info->rmdev.chip[chip_no].freq < (info->rmdev.min_frq/10 - 1))
-		rock_init_last_received_task_complete_time(info);
-
-	workdata.unused[ICARUS_UNUSED_SIZE - 3] = info->rmdev.chip[chip_no].freq; //icarus->freq/10 - 1;
-	workdata.unused[ICARUS_UNUSED_SIZE - 2] = chip_no;
+	workdata.unused[ICARUS_UNUSED_SIZE - 3] = info->rmdev.freq[chip];
+	workdata.unused[ICARUS_UNUSED_SIZE - 2] = chip;
 	workdata.unused[ICARUS_UNUSED_SIZE - 1] = 0x55;
 
 	if (opt_debug) {
@@ -1909,13 +1940,13 @@ void rock_send_task(struct cgpu_info *icarus, struct work *work, unsigned char c
 	DATA_WORK(witem)->work = work;
 	DATA_WORK(witem)->completed = false;
 	DATA_WORK(witem)->referenced = 0;
-	k_add_head(info->work_list[chip_no], witem);
-int count = info->work_list[chip_no]->count_up;
+	k_add_head(info->work_list[chip], witem);
+int count = info->work_list[chip]->count_up;
 	cgtime(&(DATA_WORK(witem)->when));
 	K_WUNLOCK(info->wfree_list);
 
 applog(LOG_RBX, "%s%i: ZZ sending work id=%u to chip %d (count now %d)",
-icarus->drv->name, icarus->device_id, work->id, chip_no, count);
+icarus->drv->name, icarus->device_id, work->id, chip, count);
 	err = usb_write_ii(icarus, info->intinfo, (char *)(&workdata), sizeof(workdata), &amount, C_SENDWORK);
 
 	if (err < 0 || amount != sizeof(workdata)) {
@@ -1924,7 +1955,7 @@ icarus->drv->name, icarus->device_id, work->id, chip_no, count);
 		dev_error(icarus, REASON_DEV_COMMS_ERROR);
 		icarus_initialise(icarus, info->baud);
 	} else
-		cgtime(&(info->last_work[chip_no]));
+		cgtime(&(info->last_work[chip]));
 }
 
 static void process_history(struct cgpu_info *icarus, struct ICARUS_INFO *info, uint32_t nonce,
@@ -2216,8 +2247,6 @@ static unsigned char store_reply(struct cgpu_info *icarus, unsigned char *nonce_
 	K_WLOCK(info->wfree_list);
 	// It can't be the result of any future work item ->prev of the head
 	whead = info->work_list[chip_no]->head;
-	if (whead)
-		DATA_WORK(whead)->referenced++;
 	witem = info->work_list[chip_no]->tail;
 	// The result 'should' usually be from the oldest incomplete work sent
 	while (witem && DATA_WORK(witem)->completed == true)
@@ -2442,13 +2471,18 @@ static struct api_data *icarus_api_stats(struct cgpu_info *cgpu)
 		root = api_add_uint8(root, "rock_chips", &(info->rmdev.detect_chip_no), false);
 		root = api_add_uint8(root, "rock_chip_max", &(info->rmdev.chip_max), false);
 		root = api_add_uint8(root, "rock_prod_id", &(info->rmdev.product_id), false);
-		root = api_add_avg(root, "rock_min_freq", &(info->rmdev.min_frq), false);
-		root = api_add_avg(root, "rock_max_freq", &(info->rmdev.max_frq), false);
+		root = api_add_avg(root, "rock_min_freq", &(info->rmdev.min_freq), false);
+		root = api_add_avg(root, "rock_max_freq", &(info->rmdev.max_freq), false);
 		root = api_add_uint64(root, "rock_check", &(info->nonces_checked), false);
 		root = api_add_uint64(root, "rock_uncheck", &(info->nonces_unchecked), false);
+		root = api_add_uint64(root, "rock_tests", &(info->nonce_tests), false);
+		if (info->nonces_checked <= 0)
+			avg = 0;
+		else
+			avg = (float)(info->nonce_tests) / (float)(info->nonces_checked);
+		root = api_add_avg(root, "rock_test_avg", &avg, true);
 		root = api_add_uint64(root, "rock_corr", &(info->nonces_correction_times), false);
 		root = api_add_uint64(root, "rock_corr_tests", &(info->nonces_correction_tests), false);
-		root = api_add_uint64(root, "rock_corr_fail", &(info->nonces_fail), false);
 		if (info->nonces_checked <= 0)
 			avg = 0;
 		else
@@ -2470,27 +2504,18 @@ static struct api_data *icarus_api_stats(struct cgpu_info *cgpu)
 		}
 		root = api_add_string(root, "rock_corr_finds", data, true);
 		root = api_add_uint64(root, "rock_work_checked", &(info->work_checked), false);
-		root = api_add_int(root, "rock_work_min", &(info->work_min), false);
-		root = api_add_int(root, "rock_work_max", &(info->work_max), false);
 		if (info->nonces_checked <= 0)
 			avg = 0;
 		else
 			avg = (float)(info->work_checked) / (float)(info->nonces_checked);
 		root = api_add_avg(root, "rock_work_avg", &avg, true);
-		root = api_add_int(root, "rock_work_height_min", &(info->work_height_min), false);
-		root = api_add_int(root, "rock_work_height_max", &(info->work_height_max), false);
-		if (info->nonces_checked <= 0)
-			avg = 0;
-		else
-			avg = (float)(info->work_height) / (float)(info->nonces_checked);
-		root = api_add_avg(root, "rock_height_avg", &avg, true);
 		data[0] = '\0';
 		off = 0;
 		for (i = 0; i < info->rmdev.chip_max; i++) {
 			len = snprintf(data+off, sizeof(data)-off,
 						"%s%d",
 						i > 0 ? "/" : "",
-						(int)(info->rmdev.chip[i].freq + 1) * 10);
+						RM_FREQ_VALUE(info->rmdev.freq[i]));
 			if (len >= (sizeof(data)-off))
 				off = sizeof(data)-1;
 			else {
@@ -2529,6 +2554,26 @@ static struct api_data *icarus_api_stats(struct cgpu_info *cgpu)
 			}
 		}
 		root = api_add_string(root, "rock_bad", data, true);
+		root = api_add_int(root, "WFree Count", &(info->wfree_list->count), true);
+		int used = info->wfree_list->total - info->wfree_list->count;
+		root = api_add_int(root, "WList Used", &used, true);
+		data[0] = '\0';
+		off = 0;
+		for (i = 0; i < info->rmdev.chip_max; i++) {
+			len = snprintf(data+off, sizeof(data)-off,
+						"%s%d",
+						i > 0 ? "/" : "",
+						info->work_list[i]->count);
+			if (len >= (sizeof(data)-off))
+				off = sizeof(data)-1;
+			else {
+				if (len > 0)
+					off += len;
+			}
+		}
+		root = api_add_string(root, "WList Chip", data, true);
+		root = api_add_int(root, "RFree Count", &(info->rfree_list->count), true);
+		root = api_add_int(root, "Results", &(info->results_list->count), true);
 	}
 
 	return root;
