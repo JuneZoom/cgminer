@@ -1507,9 +1507,10 @@ icarus->drv->name, icarus->device_id,
 				newname = "LIN"; // R-Box
 				info->rmdev.product_id = ROCKMINER_RBOX;
 				info->rmdev.chip_max = 4;
-				info->rmdev.min_freq = 200;
+				// Changing the freq has no effect on R-Box
+				info->rmdev.min_freq = 270;
 				info->rmdev.def_freq = 270;
-				info->rmdev.max_freq = 400;
+				info->rmdev.max_freq = 270;
 				break;
 			default:
 				continue;
